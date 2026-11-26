@@ -2,6 +2,10 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
+import os
+import re
+import sqlite3
+import tempfile
 
 
 class Incompatible(ValueError):
@@ -322,3 +326,326 @@ class Registry:
             for i in members:
                 routes[subs[i][0]] = rev
         return variants, routes
+
+
+# Replay-window admission limits.  These deliberately apply only to
+# replay_window; registration, Codec and Registry.publish keep their own rules.
+REPLAY_MAX_PARTITIONS = 64
+REPLAY_MAX_RECORDS = 200_000
+REPLAY_MAX_REVISIONS = 32
+REPLAY_MAX_SCHEMA_FIELDS = 24
+REPLAY_MAX_PAYLOAD_BYTES = 4 * 1024
+REPLAY_MAX_EVENT_ID_BYTES = 128
+REPLAY_MAX_STATE_BYTES = 4_096
+_REPLAY_OFFSET_MAX = 2**63 - 1
+_REPLAY_PARTITION_RE = re.compile(r"[0-9A-Za-z_-]{1,64}\Z")
+
+
+def _valid_replay_integer(value):
+    # bool is a subclass of int, but is not an exact integer coordinate.
+    return type(value) is int
+
+
+def _validate_replay_windows(windows):
+    if not isinstance(windows, Mapping) or len(windows) == 0:
+        raise ValueError("windows must be a non-empty mapping")
+    if len(windows) > REPLAY_MAX_PARTITIONS:
+        raise ValueError("too many replay partitions")
+
+    normalized = []
+    for partition, bounds in windows.items():
+        if type(partition) is not str or _REPLAY_PARTITION_RE.fullmatch(partition) is None:
+            raise ValueError("invalid replay partition name")
+        try:
+            start, stop = bounds
+        except (TypeError, ValueError):
+            raise ValueError("replay window must be a (start, stop) pair") from None
+        if not _valid_replay_integer(start) or not _valid_replay_integer(stop):
+            raise ValueError("replay window offsets must be exact integers")
+        if not 0 <= start <= stop <= _REPLAY_OFFSET_MAX:
+            raise ValueError("invalid replay window range")
+        normalized.append((partition, start, stop))
+    return normalized
+
+
+def _replay_logical_values(registry, revision, payload):
+    """Decode one record and enforce the no-default event identity rule."""
+    fields = registry._versions[revision - 1]
+    aliases = registry._aliases[revision - 1]
+    if len(fields) > REPLAY_MAX_SCHEMA_FIELDS:
+        raise ValueError("replay schema has too many physical fields")
+
+    logical_to_physical = {logical: physical for physical, logical in aliases.items()}
+    id_physical = logical_to_physical.get("event_id")
+    state_physical = logical_to_physical.get("state")
+    if id_physical is None or state_physical is None:
+        raise ValueError("revision does not alias both event_id and state")
+
+    codec = registry.codec(revision)
+    # This is intentionally the same parse/normalization path as Codec.decode,
+    # while retaining the raw object for physical-field presence checking.
+    raw = json.loads(payload, object_pairs_hook=_duplicates)
+    decoded = codec._normalize(raw, fill_defaults=True)
+    if id_physical not in raw:
+        raise ValueError("event_id must be present physically")
+
+    event_id = decoded[id_physical]
+    state = decoded[state_physical]
+    if type(event_id) is not str or type(state) is not str:
+        raise ValueError("event_id and state must be strings")
+
+    event_id_bytes = event_id.encode("utf-8")
+    state_bytes = state.encode("utf-8")
+    if not 1 <= len(event_id_bytes) <= REPLAY_MAX_EVENT_ID_BYTES:
+        raise ValueError("event_id has invalid UTF-8 length")
+    if len(state_bytes) > REPLAY_MAX_STATE_BYTES:
+        raise ValueError("state has invalid UTF-8 length")
+    return event_id_bytes, state_bytes
+
+
+def replay_window(registry, records, windows, deliver, *, scratch_dir):
+    """Decode, deduplicate across variants, and safely replay a sealed window.
+
+    The full stream is read and spooled below ``scratch_dir`` before
+    ``deliver`` is called.  Returns ``(next_offsets, blocked)``.
+    """
+    window_list = _validate_replay_windows(windows)
+    if not callable(deliver):
+        raise ValueError("deliver must be callable")
+
+    # Rank by the actual partition-name ordering used by (partition, offset).
+    # The returned dictionaries still use the caller's original window order.
+    ranked_names = sorted(partition for partition, _, _ in window_list)
+    rank = {partition: index for index, partition in enumerate(ranked_names)}
+    bounds_by_rank = {rank[partition]: (start, stop)
+                      for partition, start, stop in window_list}
+
+    with tempfile.TemporaryDirectory(prefix=".replay-window-", dir=scratch_dir) as scratch:
+        scratch_path = os.path.abspath(scratch)
+        conn = sqlite3.connect(os.path.join(scratch_path, "spool.sqlite3"))
+        try:
+            quoted_scratch = "'" + scratch_path.replace("'", "''") + "'"
+            conn.execute(f"PRAGMA temp_store_directory={quoted_scratch}")
+            conn.execute("PRAGMA temp_store=FILE")
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA mmap_size=0")
+            conn.execute("PRAGMA cache_size=-2048")
+            conn.execute(
+                """
+                CREATE TABLE records (
+                    p INTEGER NOT NULL,
+                    off INTEGER NOT NULL,
+                    status INTEGER NOT NULL,
+                    eid BLOB,
+                    state BLOB,
+                    PRIMARY KEY (p, off)
+                ) WITHOUT ROWID
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE events (
+                    eid BLOB PRIMARY KEY,
+                    first_p INTEGER NOT NULL,
+                    first_off INTEGER NOT NULL,
+                    conflict INTEGER NOT NULL DEFAULT 0
+                ) WITHOUT ROWID
+                """
+            )
+
+            referenced_revisions = set()
+            record_count = 0
+
+            for item in records:
+                record_count += 1
+                if record_count > REPLAY_MAX_RECORDS:
+                    raise ValueError("too many replay records")
+
+                if not isinstance(item, tuple) or len(item) != 4:
+                    raise ValueError("replay record must be a four-item tuple")
+                partition, offset, revision, payload = item
+
+                if (type(partition) is not str
+                        or _REPLAY_PARTITION_RE.fullmatch(partition) is None):
+                    raise ValueError("invalid replay partition name")
+                p = rank.get(partition)
+                if p is None:
+                    raise ValueError("record is outside replay windows")
+
+                if not _valid_replay_integer(offset):
+                    raise ValueError("replay offset must be an exact integer")
+                start, stop = bounds_by_rank[p]
+                if not start <= offset < stop:
+                    raise ValueError("record offset is outside its replay window")
+
+                if not _valid_replay_integer(revision) or revision <= 0:
+                    raise ValueError("revision must be a positive exact integer")
+                if revision not in referenced_revisions:
+                    if len(referenced_revisions) >= REPLAY_MAX_REVISIONS:
+                        raise ValueError("too many referenced replay revisions")
+                    referenced_revisions.add(revision)
+
+                if not isinstance(payload, bytes):
+                    raise ValueError("replay payload must be bytes")
+                if len(payload) > REPLAY_MAX_PAYLOAD_BYTES:
+                    raise ValueError("replay payload exceeds the 4 KiB limit")
+
+                status = 0
+                event_id_bytes = None
+                state_bytes = None
+                known_revision = 1 <= revision <= len(registry._versions)
+                if known_revision:
+                    if len(registry._versions[revision - 1]) > REPLAY_MAX_SCHEMA_FIELDS:
+                        raise ValueError("replay schema has too many physical fields")
+                    try:
+                        event_id_bytes, state_bytes = _replay_logical_values(
+                            registry, revision, payload)
+                        status = 1
+                    except Exception:
+                        # A poison site remains an offset barrier, but is not an
+                        # event replica.  Fatal admission errors are raised
+                        # outside this decoding block.
+                        status = 0
+                        event_id_bytes = None
+                        state_bytes = None
+
+                try:
+                    conn.execute(
+                        "INSERT INTO records (p, off, status, eid, state)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (p, offset, status, event_id_bytes, state_bytes),
+                    )
+                except sqlite3.IntegrityError:
+                    raise ValueError("duplicate partition offset in archive") from None
+
+                if status:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO events"
+                        " (eid, first_p, first_off, conflict)"
+                        " VALUES (?, ?, ?, 0)",
+                        (event_id_bytes, p, offset),
+                    )
+                    # Keep the first state as the exact comparison reference.
+                    # BLOB equality is equivalent to original Python str
+                    # equality for validated UTF-8-encodable strings.
+                    conn.execute(
+                        """
+                        UPDATE events
+                           SET conflict = 1
+                         WHERE eid = ?
+                           AND conflict = 0
+                           AND ? != (
+                               SELECT state
+                                 FROM records
+                                WHERE p = events.first_p
+                                  AND off = events.first_off
+                           )
+                        """,
+                        (event_id_bytes, state_bytes),
+                    )
+
+            next_offsets = {partition: stop
+                            for partition, _, stop in window_list}
+            blocked = {}
+
+            for partition, start, stop in window_list:
+                p = rank[partition]
+                cursor = conn.execute(
+                    """
+                    SELECT r.off, r.status, COALESCE(e.conflict, 0)
+                      FROM records r
+                      LEFT JOIN events e ON e.eid = r.eid
+                     WHERE r.p = ?
+                     ORDER BY r.off
+                    """,
+                    (p,),
+                )
+                expected = start
+                reason = None
+                try:
+                    for row_offset, row_status, conflict in cursor:
+                        if row_offset != expected:
+                            reason = "gap"
+                            break
+                        if row_status == 0:
+                            reason = "poison"
+                            break
+                        if conflict:
+                            reason = "conflict"
+                            break
+                        expected += 1
+                finally:
+                    cursor.close()
+
+                if reason is None and expected < stop:
+                    reason = "gap"
+
+                if reason is not None:
+                    # For gap, expected is the first missing offset.  For a
+                    # message barrier, expected is that poison/conflict offset.
+                    next_offsets[partition] = expected
+                    blocked[partition] = reason
+                else:
+                    next_offsets[partition] = expected
+
+            conn.execute(
+                """
+                CREATE TABLE safe_bounds (
+                    p INTEGER PRIMARY KEY,
+                    start_off INTEGER NOT NULL,
+                    safe_off INTEGER NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+            conn.executemany(
+                "INSERT INTO safe_bounds (p, start_off, safe_off)"
+                " VALUES (?, ?, ?)",
+                [(rank[partition], start, next_offsets[partition])
+                 for partition, start, _ in window_list],
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE delivered (
+                    eid BLOB PRIMARY KEY
+                ) WITHOUT ROWID
+                """
+            )
+
+            # The primary key gives (p, off) order.  The first safe row for an
+            # event is therefore its minimum safe (partition, offset) representative.
+            candidates = conn.execute(
+                """
+                SELECT r.p, r.off, r.eid, r.state
+                  FROM records r
+                  JOIN safe_bounds b ON b.p = r.p
+                  LEFT JOIN events e ON e.eid = r.eid
+                 WHERE r.status = 1
+                   AND COALESCE(e.conflict, 0) = 0
+                   AND r.off >= b.start_off
+                   AND r.off < b.safe_off
+                 ORDER BY r.p, r.off
+                """
+            )
+            try:
+                for p, offset, event_id_bytes, state_bytes in candidates:
+                    marker = conn.execute(
+                        "INSERT OR IGNORE INTO delivered (eid) VALUES (?)",
+                        (event_id_bytes,),
+                    )
+                    is_representative = marker.rowcount == 1
+                    marker.close()
+                    if is_representative:
+                        deliver(
+                            ranked_names[p],
+                            offset,
+                            event_id_bytes.decode("utf-8"),
+                            state_bytes.decode("utf-8"),
+                        )
+            finally:
+                candidates.close()
+
+            return next_offsets, blocked
+        finally:
+            conn.close()

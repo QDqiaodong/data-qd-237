@@ -76,5 +76,66 @@ variants, routes = registry.publish(
   每个订阅方 24 个逻辑字段、输入 16 KiB。`register` 与 `codec` 不受这些上限约束；
   已注册模式的默认值再大，也不会让超预算的字节交付给调用方。
 
+## 归档回放：`replay_window`
+
+`replay_window(registry, records, windows, deliver, *, scratch_dir)` 先读完并封存
+整个窗口，再按业务 `event_id` 去重和交付。它不会改动发布选版规则，也不要求输入流
+可重读或可 seek：
+
+```python
+from contracts import Field, Registry, replay_window
+
+registry = Registry()
+rev1 = registry.register(
+    {"eid": Field(str, "id-default"), "text": Field(str, "")},
+    aliases={"eid": "event_id", "text": "state"})
+rev2 = registry.register(
+    {"name": Field(str, "id-default"), "phase": Field(str, "ready")},
+    aliases={"name": "event_id", "phase": "state"})
+
+windows = {"a": (10, 14), "b": (20, 24)}
+records = [...]  # 单次遍历、任意顺序的 (partition, offset, revision, payload)
+calls = []
+
+next_offsets, blocked = replay_window(
+    registry, records, windows,
+    lambda partition, offset, event_id, state: calls.append(
+        (partition, offset, event_id, state)),
+    scratch_dir="/tmp/replay-scratch")
+# 成功后：
+# next_offsets == {"a": 11, "b": 24}
+# blocked == {"a": "gap"}
+```
+
+回放规则：
+
+- 窗口左闭右开；返回的 `next_offsets` 是每个分区的下一个未确认位点或 `stop`。
+  `blocked` 只包含被首个障碍挡住的分区，原因为 `"gap"`、`"poison"` 或
+  `"conflict"`。
+- 正整数但未注册的版本、JSON/解码失败（含重复键）、缺少逻辑 `event_id`/`state`、
+  逻辑值类型或 UTF-8 长度不合格，均为该位点的坏消息（`"poison"`），不是整个回放
+  的输入错误。`event_id` 的物理字段必须在线上对象中实际出现；非空默认值不能补造
+  身份。`state` 可以使用该版本的解码默认值。
+- 同一 `event_id` 在整个窗口内出现不同 `state` 时，其全部可读副本均为冲突；冲突
+  判断会参考缺位之后的副本。每个分区只确认从 `start` 开始的连续安全前缀。
+- 安全前缀内的每个事件交付一次，代表是安全副本中 `(partition, offset)` 最小者；
+  即使全局更小坐标的副本因缺位/冲突不在安全前缀内，也不会漏送安全代表。调用顺序
+  按代表坐标升序。
+- 重复 `(partition, offset)`、窗口外记录、外层结构错误或超过回放上限会以
+  `ValueError` 拒绝整次回放；记录迭代抛出的原异常原样传播。这些路径以及消费者异常
+  路径都不会返回确认位点，且成功读完前不会调用 `deliver`。
+- 回放上限为 64 个窗口分区、200,000 条记录、32 个被引用版本、每个被引用注册模式
+  24 个物理字段、每条 payload 4 KiB。它们只约束 `replay_window`。
+- 长状态会溢出到 `scratch_dir` 下的临时 SQLite 暂存库；函数返回或抛异常时删除本次
+  创建的临时目录。缺位通过排序后的已见位点定位，不枚举十亿级窗口。
+
+可运行示例与内存验收：
+
+```sh
+python3 replay_example.py
+python3 -m unittest -v
+python3 replay_memory_check.py --records 70000 --state-bytes 1200
+```
+
 `demo.py` 演示同一消息、同一组订阅方在 1 份/61 字节（共享表示）、2 份/36 字节
 （两份窄表示）与 1 份/36 字节（`budget` 失败）三种预算下的不同交付结果。
