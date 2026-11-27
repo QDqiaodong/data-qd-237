@@ -12,6 +12,41 @@ class Incompatible(ValueError):
     pass
 
 
+class PolicyUnsatisfiable(ValueError):
+    """No strictly encodable message can satisfy every mandatory clause."""
+
+
+class PolicyViolation(ValueError):
+    """A guarded codec rejected real bytes through a semantic policy clause."""
+
+    def __init__(self, policy_kind, clause_index):
+        if policy_kind not in ("read", "emit"):
+            raise ValueError("policy_kind must be 'read' or 'emit'")
+        self.policy_kind = policy_kind
+        self.clause_index = clause_index
+        super().__init__(
+            f"{policy_kind} policy rejected clause {clause_index}")
+
+
+class SemanticIncompatible(Incompatible):
+    """Real bytes the writer may produce are refused by a reader's policy.
+
+    ``payload`` is producible by the writer's original codec, satisfies the
+    writer's policies under the proposed rules, and violates the reader's
+    receiving clause at ``clause_index`` when the reader interprets those
+    exact bytes with its own read rules and defaults.
+    """
+
+    def __init__(self, writer_revision, reader_revision, payload, clause_index):
+        self.writer_revision = writer_revision
+        self.reader_revision = reader_revision
+        self.payload = payload
+        self.clause_index = clause_index
+        super().__init__(
+            f"revision {writer_revision} output is rejected by revision "
+            f"{reader_revision} receiving clause {clause_index}: {payload!r}")
+
+
 class DeliveryError(ValueError):
     """A valid publish request has no complete delivery plan.
 
@@ -81,6 +116,348 @@ def _duplicates(pairs):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Semantic policies
+#
+# A declaration is a conjunction (outer list/tuple) of clauses, where each
+# clause is a disjunction (non-empty list/tuple) of atoms.  An atom is a
+# triple ``(op, physical_name, operand)``.  Atoms only ever address physical
+# names declared by the revision that owns the declaration; logical aliases
+# never rebind them.
+# ---------------------------------------------------------------------------
+
+_POLICY_OPS = frozenset(("present", "absent", "eq", "ne"))
+POLICY_MAX_CLAUSES = 64
+POLICY_MAX_ATOMS_PER_CLAUSE = 6
+POLICY_MAX_LITERALS_PER_FIELD = 6
+POLICY_MAX_STRING_LITERAL = 256
+POLICY_INTEGER_MIN = -(2**63)
+POLICY_INTEGER_MAX = 2**63 - 1
+# Resource bounds that only apply while any non-empty declaration is in use.
+POLICY_MAX_REVISIONS = 32
+POLICY_MAX_FIELDS = 32
+
+
+def _parse_policy(declaration, fields):
+    """Validate and deep-copy one policy declaration.
+
+    The stored form is a tuple of tuples of ``(op, name, operand)`` triples,
+    so later mutation of the caller's lists or literals cannot leak in.
+    ``None`` or an empty outer declaration means no extra restriction.
+    """
+    if declaration is None:
+        return ()
+    if not isinstance(declaration, (list, tuple)):
+        raise ValueError("policy must be None or a list/tuple of clauses")
+    if len(declaration) > POLICY_MAX_CLAUSES:
+        raise ValueError("policy declares too many clauses")
+    parsed_clauses = []
+    literals_by_field = {}
+    for clause in declaration:
+        if not isinstance(clause, (list, tuple)) or not clause:
+            raise ValueError("each policy clause must be a non-empty list/tuple")
+        if len(clause) > POLICY_MAX_ATOMS_PER_CLAUSE:
+            raise ValueError("policy clause contains too many atoms")
+        parsed_atoms = []
+        for atom in clause:
+            if not isinstance(atom, (list, tuple)) or len(atom) != 3:
+                raise ValueError("each policy atom must be a (op, name, operand) triple")
+            op, name, operand = atom
+            if op not in _POLICY_OPS:
+                raise ValueError(f"unknown policy operator: {op!r}")
+            if type(name) is not str or name not in fields:
+                raise ValueError("policy atoms may only reference declared physical names")
+            field = fields[name]
+            if op in ("present", "absent"):
+                if operand is not None:
+                    raise ValueError("present/absent atoms require an operand of None")
+            else:
+                # Exact type match: bool must never pass as an int.
+                if type(operand) is not field.kind:
+                    raise ValueError("policy literal has the wrong type for its field")
+                if field.kind is str:
+                    if len(operand) > POLICY_MAX_STRING_LITERAL:
+                        raise ValueError("policy string literal is too long")
+                else:
+                    if not POLICY_INTEGER_MIN <= operand <= POLICY_INTEGER_MAX:
+                        raise ValueError("policy integer literal is outside signed 64-bit")
+                seen = literals_by_field.setdefault(name, set())
+                if operand not in seen:
+                    if len(seen) >= POLICY_MAX_LITERALS_PER_FIELD:
+                        raise ValueError("too many comparison literals for one field")
+                    seen.add(operand)
+            parsed_atoms.append((op, name, operand))
+        parsed_clauses.append(tuple(parsed_atoms))
+    return tuple(parsed_clauses)
+
+
+def _read_view(fields, raw):
+    """The revision's read values for a raw object, including own defaults."""
+    return {name: raw[name] if name in raw else field.default
+            for name, field in fields.items()}
+
+
+def _atom_holds(atom, raw, view):
+    op, name, operand = atom
+    if op == "present":
+        return name in raw
+    if op == "absent":
+        return name not in raw
+    if op == "eq":
+        return view[name] == operand
+    return view[name] != operand  # ne
+
+
+def _first_failing_clause(policy, raw, view):
+    """Return the zero-based index of the first violated clause, else None."""
+    for index, clause in enumerate(policy):
+        if not any(_atom_holds(atom, raw, view) for atom in clause):
+            return index
+    return None
+
+
+def _policy_literals(policies):
+    """Comparison literals used against each field across declarations."""
+    literals = {}
+    for policy in policies:
+        for clause in policy:
+            for op, name, operand in clause:
+                if op in ("eq", "ne"):
+                    literals.setdefault(name, set()).add(operand)
+    return literals
+
+
+def _build_domains(fields, policies):
+    """Finite raw-object domains that cover every policy truth assignment.
+
+    Each optional field can be absent or present; every field may take its
+    default value and every literal compared against it.  For optional fields
+    the default is reachable through absence anyway, so one state is enough.
+    """
+    literals = _policy_literals(policies)
+    type_bases = {int: 0, str: "", bool: False}
+    domains = {}
+    for name, field in fields.items():
+        values = set(literals.get(name, ()))
+        # The type base value plus the revision's own default cover every
+        # value a satisfying assignment or a violating assignment can need:
+        # comparisons only distinguish literals, and presence/absence is
+        # represented by the state wrapper rather than the value itself.
+        values.add(type_bases[field.kind])
+        if not field.required:
+            values.add(field.default)
+        states = tuple(sorted(values, key=lambda value: (type(value).__name__, value)))
+        if field.required:
+            domains[name] = [(True, value) for value in states]
+        else:
+            domains[name] = [(False, None)] + [(True, value) for value in states]
+    return domains
+
+
+def _state_predicate(atom, fields):
+    """Compile an atom over this revision's variables to a state predicate."""
+    op, name, operand = atom
+    field = fields[name]
+
+    def predicate(state):
+        present, value = state
+        if op == "present":
+            return present
+        if op == "absent":
+            return not present
+        read_value = value if present else field.default
+        if op == "eq":
+            return read_value == operand
+        return read_value != operand
+
+    return predicate
+
+
+def _solve_cnf(domains, clauses):
+    """Backtracking CNF satisfiability over finite per-variable state domains.
+
+    Each clause is a tuple of ``(variable_name, state_predicate)`` pairs and
+    every predicate is unary.  For every clause the support states of each
+    participating variable are precomputed.  Search uses:
+
+    * sound unit propagation: an open clause whose other variables are all
+      assigned without satisfying it restricts its sole remaining variable to
+      its support states (a domain restriction, never an unsound "force");
+    * wipeout detection: an open clause with no unassigned variable still
+      holding a support state contradicts the branch;
+    * minimum-domain branching, tied on the number of open clauses involved.
+
+    The result is exact (no sampling, no SAT uncertainty) and cheap for the
+    bounded 32-field / 64-clause declarations; every branch works on its own
+    domain copy, so failed branches leave no residue.
+    """
+    clause_vars = []
+    supports = []
+    for clause in clauses:
+        variables = tuple(dict.fromkeys(name for name, _ in clause))
+        clause_vars.append(variables)
+        support = {}
+        for name, predicate in clause:
+            support.setdefault(name, ())
+            support[name] = tuple(dict.fromkeys(
+                support[name] + tuple(state for state in domains[name]
+                                      if predicate(state))))
+        supports.append(support)
+
+    def open_clause_degree(name, assignment):
+        degree = 0
+        for index, variables in enumerate(clause_vars):
+            if name not in variables:
+                continue
+            clause = clauses[index]
+            if not any(n in assignment and p(assignment[n])
+                       for n, p in clause):
+                degree += 1
+        return degree
+
+    def search(active, assignment):
+        # Fixed-point unit propagation and wipeout detection on the
+        # branch-local domain copy.
+        changed = True
+        while changed:
+            changed = False
+            for index, clause in enumerate(clauses):
+                if any(n in assignment and p(assignment[n])
+                       for n, p in clause):
+                    continue
+                unassigned = [n for n in clause_vars[index]
+                              if n not in assignment]
+                if not unassigned:
+                    return None
+                if len(unassigned) == 1:
+                    name = unassigned[0]
+                    allowed = [state for state in active[name]
+                               if state in supports[index][name]]
+                    if not allowed:
+                        return None
+                    if len(allowed) != len(active[name]):
+                        active[name] = allowed
+                        changed = True
+                elif not any(any(state in supports[index][name]
+                                 for state in active[name])
+                             for name in unassigned):
+                    return None
+
+        if len(assignment) == len(domains):
+            return assignment
+
+        name = min(
+            (n for n in domains if n not in assignment),
+            key=lambda n: (len(active[n]), -open_clause_degree(n, assignment)))
+        for state in active[name]:
+            next_active = {n: list(states) for n, states in active.items()}
+            next_active[name] = [state]
+            next_assignment = dict(assignment)
+            next_assignment[name] = state
+            result = search(next_active, next_assignment)
+            if result is not None:
+                return result
+        return None
+
+    initial = {name: list(states) for name, states in domains.items()}
+    return search(initial, {})
+
+
+def _find_own_assignment(fields, policies):
+    """One raw object satisfying every own declaration, or None."""
+    policies = [policy for policy in policies if policy]
+    if not policies:
+        return None
+    domains = _build_domains(fields, policies)
+    clauses = []
+    for policy in policies:
+        for clause in policy:
+            clauses.append(tuple((atom[1], _state_predicate(atom, fields))
+                                 for atom in clause))
+    assignment = _solve_cnf(domains, clauses)
+    if assignment is None:
+        return None
+    return {name: state[1] for name, state in assignment.items() if state[0]}
+
+
+def _find_semantic_counterexample(writer_fields, writer_policies,
+                                  reader_fields, reader_policy):
+    """Search writer-raw bytes that pass every writer rule but fail a reader.
+
+    The reader always interprets the writer's exact raw object with its own
+    read rules and defaults; defaults are never filled in for the writer and
+    logical aliases never rebind physical names.
+    """
+    policies = list(writer_policies) + [reader_policy]
+    domains = _build_domains(writer_fields, policies)
+
+    clauses = []
+    for policy in writer_policies:
+        for clause in policy:
+            clauses.append(tuple((atom[1], _state_predicate(atom, writer_fields))
+                                 for atom in clause))
+
+    for clause_index, clause in enumerate(reader_policy):
+        reader_clause = []
+        permanently_satisfied = False
+        for atom in clause:
+            op, name, operand = atom
+            if name not in writer_fields:
+                # The writer can never put this physical key on the wire, so
+                # the reader's atom has one fixed truth value for every writer
+                # object: permanent absence, or its own defaulted read value.
+                if op == "present":
+                    continue  # always False, cannot help satisfy the clause
+                if op == "absent":
+                    permanently_satisfied = True
+                    break
+                read_value = reader_fields[name].default
+                if ((op == "eq" and read_value == operand)
+                        or (op == "ne" and read_value != operand)):
+                    permanently_satisfied = True
+                    break
+                continue  # always False
+            field = reader_fields[name]
+
+            def predicate(state, op=op, field=field, operand=operand):
+                present, value = state
+                if op == "present":
+                    return present
+                if op == "absent":
+                    return not present
+                read_value = value if present else field.default
+                if op == "eq":
+                    return read_value == operand
+                return read_value != operand
+
+            reader_clause.append((name, predicate))
+        if permanently_satisfied:
+            # This reader clause holds for every object the writer may make.
+            continue
+        if not reader_clause:
+            # Every atom is false for every object the writer may produce, so
+            # the whole reader clause is violated.
+            assignment = _solve_cnf(domains, clauses)
+        else:
+            # Negating a disjunction requires every atom to be false at once.
+            # Each negated atom becomes its own single-atom conjunct; atoms
+            # that mention the same variable are combined into one predicate.
+            negated_by_name = {}
+            for name, predicate in reader_clause:
+                negated_by_name.setdefault(name, []).append(predicate)
+            negation_clauses = []
+            for name, predicates in negated_by_name.items():
+                combined = (lambda state, preds=predicates:
+                            all(not predicate(state) for predicate in preds))
+                negation_clauses.append([(name, combined)])
+            assignment = _solve_cnf(domains, clauses + negation_clauses)
+        if assignment is not None:
+            raw = {name: state[1] for name, state in assignment.items()
+                   if state[0]}
+            return raw, clause_index
+    return None, None
+
+
 class Codec:
     def __init__(self, fields):
         self._fields = _fields(fields)
@@ -112,6 +489,57 @@ class Codec:
                                fill_defaults=True)
 
 
+class GuardedCodec:
+    """Original physical codec plus this revision's semantic policy checks.
+
+    The wrapper always consults the registry's *current* production limit, so
+    codecs handed out before a successful ``set_emit_policy`` call observe the
+    same production decisions as codecs handed out afterwards.
+    """
+
+    def __init__(self, registry, revision):
+        self._registry = registry
+        self._revision = revision
+        self._codec = Codec(registry._versions[revision - 1])
+
+    @property
+    def fields(self):
+        return self._codec._fields
+
+    def encode(self, values):
+        # Physical rules first, exactly as the original codec enforces them.
+        if not isinstance(values, dict) or values.keys() - self._codec._fields.keys():
+            raise ValueError("producer included undeclared fields")
+        raw = self._codec._normalize(values, fill_defaults=False)
+        payload = json.dumps(raw, sort_keys=True,
+                             separators=(",", ":")).encode("ascii")
+        fields = self._codec._fields
+        view = _read_view(fields, raw)
+        revision = self._revision
+        policy = self._registry._policies[revision - 1]
+        failing = _first_failing_clause(policy, raw, view)
+        if failing is not None:
+            raise PolicyViolation("read", failing)
+        emit_policy = self._registry._emit_policies[revision - 1]
+        failing = _first_failing_clause(emit_policy, raw, view)
+        if failing is not None:
+            raise PolicyViolation("emit", failing)
+        return payload
+
+    def decode(self, payload):
+        # The original decode path keeps every physical rule (duplicate keys,
+        # type checks, required fields, projection of undeclared keys).
+        raw = json.loads(payload, object_pairs_hook=_duplicates)
+        decoded = self._codec._normalize(raw, fill_defaults=True)
+        fields = self._codec._fields
+        failing = _first_failing_clause(
+            self._registry._policies[self._revision - 1],
+            raw, _read_view(fields, raw))
+        if failing is not None:
+            raise PolicyViolation("read", failing)
+        return decoded
+
+
 def _check(writer, reader, detail):
     for name, field in reader.items():
         sent = writer.get(name)
@@ -133,25 +561,130 @@ class Registry:
     def __init__(self):
         self._versions = []
         self._aliases = []
+        self._policies = []
+        self._emit_policies = []
+        # Becomes true exactly when a non-empty semantic declaration exists.
+        # It never goes back to false, which keeps the bounded scope stable.
+        self._semantic_mode = False
 
-    def register(self, fields, *, aliases=None):
+    def _check_constrained_limits(self, candidate_fields, candidate_policy,
+                                  candidate_emit, adding_revision):
+        constrained = self._semantic_mode or bool(candidate_policy) \
+            or bool(candidate_emit)
+        if not constrained:
+            return
+        revision_count = len(self._versions) + (1 if adding_revision else 0)
+        if revision_count > POLICY_MAX_REVISIONS:
+            raise ValueError("at most 32 revisions while semantic policies are in use")
+        if len(candidate_fields) > POLICY_MAX_FIELDS:
+            raise ValueError("at most 32 declared fields per policy-participating revision")
+        for fields in self._versions:
+            if len(fields) > POLICY_MAX_FIELDS:
+                raise ValueError(
+                    "at most 32 declared fields per policy-participating revision")
+
+    def register(self, fields, *, aliases=None, policy=None, emit_policy=None):
         candidate = _fields(fields)
         alias_map = _alias_map(candidate, aliases)
+        candidate_policy = _parse_policy(policy, candidate)
+        candidate_emit = _parse_policy(emit_policy, candidate)
+        # Semantic limits only apply while declarations are actually in use;
+        # the original unbounded entry points keep their historical scope.
+        self._check_constrained_limits(
+            candidate, candidate_policy, candidate_emit, adding_revision=True)
+
+        candidate_revision = len(self._versions) + 1
+        # All original physical compatibility checks remain mandatory and no
+        # semantic declaration can exempt a revision from them.
         for revision, existing in enumerate(self._versions, 1):
             _check(existing, candidate, f"revision {revision} to candidate")
             _check(candidate, existing, f"candidate to revision {revision}")
+
+        # The candidate itself must still have at least one producible object
+        # under both of its own declarations.
+        own = _find_own_assignment(
+            candidate, [candidate_policy, candidate_emit])
+        if (candidate_policy or candidate_emit) and own is None:
+            raise PolicyUnsatisfiable(
+                "candidate has no object satisfying its semantic declarations")
+
+        # Exact, byte-level cross-revision preflight in both directions.
+        for revision, existing in enumerate(self._versions, 1):
+            raw, clause_index = _find_semantic_counterexample(
+                candidate, [candidate_policy, candidate_emit],
+                existing, self._policies[revision - 1])
+            if raw is not None:
+                self._raise_semantic(candidate_revision, revision, candidate,
+                                     existing, raw, clause_index)
+            raw, clause_index = _find_semantic_counterexample(
+                existing,
+                [self._policies[revision - 1],
+                 self._emit_policies[revision - 1]],
+                candidate, candidate_policy)
+            if raw is not None:
+                self._raise_semantic(revision, candidate_revision, existing,
+                                     candidate, raw, clause_index)
+
         self._versions.append(candidate)
         self._aliases.append(alias_map)
+        self._policies.append(candidate_policy)
+        self._emit_policies.append(candidate_emit)
+        if candidate_policy or candidate_emit:
+            self._semantic_mode = True
         return len(self._versions)
+
+    def _raise_semantic(self, writer_revision, reader_revision, writer_fields,
+                        reader_fields, raw, clause_index):
+        payload = Codec(writer_fields).encode(raw)
+        # The counterexample must survive both ends' original read rules:
+        # the writer produced it, and the reader can decode the same bytes
+        # before its receiving policy turns them down.
+        Codec(writer_fields).decode(payload)
+        Codec(reader_fields).decode(payload)
+        raise SemanticIncompatible(writer_revision, reader_revision,
+                                   payload, clause_index)
+
+    def set_emit_policy(self, revision, emit_policy):
+        fields, _ = self._version(revision)
+        new_emit = _parse_policy(emit_policy, fields)
+        self._check_constrained_limits(
+            fields, self._policies[revision - 1], new_emit,
+            adding_revision=False)
+
+        own = _find_own_assignment(
+            fields, [self._policies[revision - 1], new_emit])
+        if (self._policies[revision - 1] or new_emit) and own is None:
+            raise PolicyUnsatisfiable(
+                "revision has no object left to produce under the new limit")
+
+        # Every currently registered reader, including this revision, must
+        # still accept every object the writer may produce under the proposal.
+        for reader_revision, reader_fields in enumerate(self._versions, 1):
+            raw, clause_index = _find_semantic_counterexample(
+                fields,
+                [self._policies[revision - 1], new_emit],
+                reader_fields, self._policies[reader_revision - 1])
+            if raw is not None:
+                self._raise_semantic(revision, reader_revision, fields,
+                                     reader_fields, raw, clause_index)
+
+        # Commit only after every check succeeded: failed replacements never
+        # change the production limit observed by existing codecs.
+        self._emit_policies[revision - 1] = new_emit
+        if new_emit:
+            self._semantic_mode = True
+        return None
 
     def _version(self, revision):
         if type(revision) is not int or not 1 <= revision <= len(self._versions):
             raise KeyError(revision)
         return self._versions[revision - 1], self._aliases[revision - 1]
 
-    def codec(self, revision):
+    def codec(self, revision, *, guarded=False):
         fields, _ = self._version(revision)
-        return Codec(fields)
+        if not guarded:
+            return Codec(fields)
+        return GuardedCodec(self, revision)
 
     def publish(self, source_revision, payload, *, enabled, subscriptions,
                 max_variants, max_bytes):

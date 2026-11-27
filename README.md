@@ -24,6 +24,77 @@ python3 demo.py
 不能指向同一逻辑名。别名随物理模式一起校验、一起冻结：注册后调用方修改原字典
 不影响已注册版本；任一检查失败都不消耗版本号。别名不替代物理兼容检查。
 
+## 语义约束注册与分阶段收紧：`policy` / `emit_policy` / guarded Codec
+
+两个进程都能解析同一条 JSON，不代表它们会接受同一组业务字段。`register` 支持两份
+语义声明，用真实字节做精确预检，让运维先收紧旧写法、再装入新的读模式：
+
+- `policy` 是修订的**接收约束**，注册后不可变；`emit_policy` 是可替换的**额外生产
+  限制**，通过 `Registry.set_emit_policy(revision, emit_policy)` 调整。两者同格式。
+- 声明最外层列表/元组是条件的合取（全部成立），每个条件是非空列表/元组的析取
+  （至少一个原子成立）。原子是 `(op, physical_name, operand)` 三元组：
+  - `("present", name, None)` / `("absent", name, None)` 检查原始 JSON 对象里是否
+    真有该物理键，默认值不算键出现；
+  - `("eq", name, literal)` / `("ne", name, literal)` 比较本修订按自己的读规则得到
+    的值（含自身默认值），字面量类型必须与字段完全相同，布尔不能当整数。
+  - 原子只能引用本修订声明的物理名，逻辑别名不参与改绑。`None` 或空外层表示无限制。
+- 每份声明至多 64 个条件、每条件至多 6 个原子、同字段至多 6 个比较字面量；字符串
+  字面量至多 256 字符，整数字面量须在有符号 64 位内（这是声明字面量的范围，不是消息
+  值域）。只要存在任一非空声明，注册表至多 32 个修订、每个参与修订至多 32 个声明
+  字段；完全不使用约束时沿用原入口的范围。声明注册时深拷贝，调用方之后修改不生效。
+
+```python
+from contracts import Field, PolicyViolation, Registry, SemanticIncompatible
+
+registry = Registry()
+receiving = [[("ne", "channel", "live"), ("eq", "armed", True)]]
+old = registry.register(
+    {"id": Field(int), "channel": Field(str, "offline"),
+     "armed": Field(bool, True)}, policy=receiving)
+
+# 候选把 armed 默认翻成 False：旧写端省略开关的 live 字节会被新读端拒绝。
+try:
+    registry.register(
+        {"id": Field(int), "channel": Field(str, "offline"),
+         "armed": Field(bool, False)}, policy=receiving)
+except SemanticIncompatible as error:
+    error.writer_revision, error.reader_revision  # 1, 2
+    error.payload          # 可由旧 Codec 生产的真实 bytes
+    error.clause_index     # 被违反的接收子句（从 0 开始）
+
+# 先收紧旧写法（一个 OR 条件：非 live，或物理上带开关），候选即可注册。
+registry.set_emit_policy(
+    old, [[("ne", "channel", "live"), ("present", "armed", None)]])
+new = registry.register(
+    {"id": Field(int), "channel": Field(str, "offline"),
+     "armed": Field(bool, False)}, policy=receiving)
+```
+
+预检与运行期规则：
+
+- 修订可生产的对象必须能用其原 `Codec` 严格编码，并同时满足自己的 `policy` 与当时
+  生效的 `emit_policy`；不存在任何可生产对象时抛 `PolicyUnsatisfiable`
+  （`ValueError` 子类），不能以零写入证明兼容。
+- 所有原物理兼容检查保留，语义约束不豁免任何原检查。候选对每个已注册修订做两个方向的
+  字节级预检：取写端在本次提议下可生产的某份原始对象，让读端用**自己的默认值**直接
+  解释同一份字节；任一会被读端接收约束拒绝即抛 `SemanticIncompatible`（携带
+  `writer_revision`、`reader_revision`、`payload`、`clause_index`），不消耗新号、
+  不留可取候选。不抽样、不比较声明文本、不依赖求解不确定。
+- `set_emit_policy` 替换生产限制：新限制须仍有可生产对象，且这些对象能被每个现存
+  修订直读并通过其接收约束。收紧与放宽都允许；失败不改变生效限制。之后的注册按写修订
+  **当前**允许生产的对象判断。未知修订抛 `KeyError`。
+- `codec(revision)` 默认仍是原物理 Codec，不增加语义检查。`codec(revision,
+  guarded=True)` 返回的 Codec 先走原有编解码规则再查约束：编码检查接收约束与**当前**
+  生产限制（两者都失败先报接收约束），解码只检查接收约束；失败抛 `PolicyViolation`
+  （携带 `policy_kind` 为 `"read"`/`"emit"` 与 `clause_index`）。替换成功前取得的
+  guarded Codec 与之后取得的判定始终一致。
+
+```sh
+python3 semantic_policy_example.py
+python3 -m unittest -v
+python3 semantic_resource_check.py   # 全新进程：墙钟 < 5s、峰值 RSS < 64 MiB
+```
+
 ## 滚动升级中继：`Registry.publish`
 
 同一次发布要服务处于不同升级阶段的订阅方。`publish` 按订阅能力选择目标版本并
