@@ -1,8 +1,10 @@
 """A JSON record codec and a cumulative rollout compatibility registry."""
 from array import array
 from bisect import bisect_right
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from heapq import heapify, heappop, heappush
 import json
 import os
 import re
@@ -1936,3 +1938,323 @@ class LiveRelay:
             raise ValueError("invalid, used, or foreign cutover ticket")
         ticket.open = False
         self._ticket = None
+
+
+# ---------------------------------------------------------------------------
+# Work relay: a keyed work queue over the caller's fixed-size block region.
+#
+# Several processing groups draw from one queue, and later tasks sharing a
+# business key must wait for each group's earlier task.  A message's blocks are
+# accounted once and only returned once every group has acknowledged it.  The
+# relay keeps scheduling state (lengths, locations, keys, per-group progress)
+# in memory but never caches payload bytes across calls: every claim re-reads
+# the original JSON bytes from the block region.  All admission checks run
+# before any storage access, so a rejected send never touches the store.
+# ---------------------------------------------------------------------------
+WORK_MAX_GROUPS = 8
+WORK_MAX_FIELDS = 24
+WORK_MAX_KEY_BYTES = 128
+WORK_MAX_PAYLOAD_BYTES = 4 * 1024
+WORK_BLOCK_SIZES = (256, 512, 1024, 2048, 4096)
+WORK_MIN_BLOCK_COUNT = 1
+WORK_MAX_BLOCK_COUNT = 32_768
+
+
+class _WorkTicket:
+    """Opaque, single-use handle for one group's claim of one message."""
+
+    __slots__ = ("relay", "group", "offset", "open")
+
+    def __init__(self, relay, group, offset):
+        self.relay = relay
+        self.group = group
+        self.offset = offset
+        self.open = True
+
+
+class WorkRelay:
+    """Single-process keyed work queue over a fixed block region.
+
+    ``groups`` maps 1-8 non-empty group names to ``(reader_revision,
+    required_keys)`` and is frozen at construction.  Each group's required
+    logical fields must be non-empty, include ``"work_key"``, and all be
+    declared by that group's own (at most 24 physical field) revision.  The
+    caller owns a block region of ``block_count + 4096 // block_size`` blocks;
+    only the first ``block_count`` blocks add admission capacity.
+    """
+
+    def __init__(self, registry, store, groups, *, block_size, block_count):
+        if not isinstance(registry, Registry):
+            raise ValueError("registry must be a Registry")
+        for method in ("read", "write"):
+            if not callable(getattr(store, method, None)):
+                raise ValueError("store must provide read/write")
+        if type(block_size) is not int or block_size not in WORK_BLOCK_SIZES:
+            raise ValueError("block_size must be one of 256, 512, 1024, 2048, 4096")
+        if (type(block_count) is not int
+                or not WORK_MIN_BLOCK_COUNT <= block_count <= WORK_MAX_BLOCK_COUNT):
+            raise ValueError("block_count must be an integer from 1 to 32768")
+        if not isinstance(groups, Mapping) or not groups:
+            raise ValueError("groups must be a non-empty mapping")
+        if len(groups) > WORK_MAX_GROUPS:
+            raise ValueError("too many groups")
+
+        self._registry = registry
+        self._store = store
+        self._block_size = block_size
+        self._block_count = block_count
+        # The spare blocks beyond block_count exist only for the caller's
+        # relocation needs; allocations come solely from the ordinary region.
+        self._free = list(range(block_count))
+        heapify(self._free)
+        self._used_blocks = 0
+
+        self._groups = {}
+        for group_id, spec in groups.items():
+            if type(group_id) is not str or not group_id:
+                raise ValueError("group ids must be non-empty strings")
+            try:
+                reader_revision, required_keys = spec
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "group value must be (reader_revision, required_keys)") \
+                    from None
+            fields, _ = registry._version(reader_revision)  # KeyError if unknown
+            if len(fields) > WORK_MAX_FIELDS:
+                raise ValueError(
+                    "relay revisions may declare at most 24 physical fields")
+            if isinstance(required_keys, (str, bytes, bytearray)) \
+                    or not hasattr(required_keys, "__iter__"):
+                raise ValueError(
+                    "required_keys must be a collection of logical names")
+            required = []
+            for key in required_keys:
+                if type(key) is not str or not key:
+                    raise ValueError("required keys must be non-empty strings")
+                if key not in required:
+                    required.append(key)
+            if not required:
+                raise ValueError("required keys must be non-empty")
+            if "work_key" not in required:
+                raise ValueError("each group must require logical field 'work_key'")
+            reverse = _live_reverse_aliases(registry, reader_revision)
+            for key in required:
+                if key not in reverse:
+                    raise ValueError(
+                        f"revision {reader_revision} does not declare logical "
+                        f"field {key!r}")
+            self._groups[group_id] = {
+                "reader_revision": reader_revision,
+                "required": tuple(required),
+                # Per-key deque of offsets still owed by this group, plus the
+                # subset currently being processed.  A claimed head blocks the
+                # same key, but other keys remain claimable.
+                "pending": {},
+                "claimed": set(),
+            }
+
+        # Global pool of messages still owed by at least one group.
+        self._messages = {}
+        self._next_offset = 0
+
+    # ---- validation helpers ---------------------------------------------
+
+    def _group(self, group_id):
+        if type(group_id) is not str:
+            raise KeyError(group_id)
+        try:
+            return self._groups[group_id]
+        except KeyError:
+            raise KeyError(group_id) from None
+
+    def _open_ticket(self, ticket):
+        return (isinstance(ticket, _WorkTicket) and ticket.open
+                and ticket.relay is self
+                and ticket.group in self._groups)
+
+    # ---- data plane: enqueue --------------------------------------------
+
+    def send(self, writer_revision, values):
+        """Encode, validate against every group, then write the raw JSON."""
+        fields, aliases = self._registry._version(writer_revision)  # KeyError
+        if len(fields) > WORK_MAX_FIELDS:
+            raise ValueError(
+                "relay revisions may declare at most 24 physical fields")
+
+        # The writer encodes with the guarded codec: original physical rules
+        # plus the revision's current production limits.  Encoding errors,
+        # including PolicyViolation, propagate unchanged.
+        payload = self._registry.codec(
+            writer_revision, guarded=True).encode(values)
+        if not isinstance(payload, (bytes, bytearray)) \
+                or not 1 <= len(payload) <= WORK_MAX_PAYLOAD_BYTES:
+            raise ValueError("relay payload exceeds the 4 KiB limit")
+        payload = bytes(payload)
+
+        # The business key must really be on the wire; a read-side default may
+        # never stand in for it.  All groups require work_key, so it must be a
+        # string field declared by the writer's own revision.
+        writer_reverse = _live_reverse_aliases(self._registry, writer_revision)
+        key_physical = writer_reverse.get("work_key")
+        if key_physical is None or fields[key_physical].kind is not str:
+            raise ValueError(
+                f"writer revision {writer_revision} does not declare a string "
+                "logical 'work_key' field")
+        raw = json.loads(payload, object_pairs_hook=_duplicates)
+        if key_physical not in raw:
+            raise ValueError("work_key must be present physically")
+        writer_decoded = Codec(fields).decode(payload)
+        work_key = writer_decoded[key_physical]
+        if type(work_key) is not str or not work_key \
+                or not 1 <= len(work_key.encode("utf-8")) <= WORK_MAX_KEY_BYTES:
+            raise ValueError("work_key has invalid UTF-8 length")
+
+        # One logical reference view of the writer's actual read values,
+        # interpreted through the writer revision's own aliases.
+        writer_logical = {aliases[name]: value
+                          for name, value in writer_decoded.items()}
+
+        # Every group must decode the exact same bytes with its own guarded
+        # codec (physical read rules plus its receiving policy, never today's
+        # production limits) and recover every required field, exact type and
+        # value, under that revision's aliases and defaults.
+        for group_id, group in self._groups.items():
+            revision = group["reader_revision"]
+            read = _live_read_required(
+                self._registry, payload, revision, group["required"])
+            if read is None:
+                raise DeliveryError(
+                    "unfaithful",
+                    f"group {group_id!r} cannot read revision "
+                    f"{revision} bytes")
+            for key in group["required"]:
+                if key not in writer_logical:
+                    raise DeliveryError(
+                        "unfaithful",
+                        f"writer does not declare logical field {key!r}")
+                writer_value = writer_logical[key]
+                reader_value = read[key]
+                if type(writer_value) is not type(reader_value) \
+                        or writer_value != reader_value:
+                    raise DeliveryError(
+                        "unfaithful",
+                        f"group {group_id!r} would change {key!r}")
+
+        # All message checks are complete; only now may space be considered.
+        blocks_needed = (len(payload) + self._block_size - 1) // self._block_size
+        if self._used_blocks + blocks_needed > self._block_count:
+            raise DeliveryError("backlog_full")
+
+        offset = self._next_offset
+        allocated = []
+        try:
+            for chunk_index in range(blocks_needed):
+                start = chunk_index * self._block_size
+                block = payload[start:start + self._block_size]
+                if len(block) < self._block_size:
+                    block = block + b"\x00" * (self._block_size - len(block))
+                block_index = heappop(self._free)
+                allocated.append(block_index)
+                self._store.write(block_index, block)
+        except BaseException:
+            # A failed write changes nothing logically: the message cannot be
+            # claimed, consumes no offset and no quota.  Blocks written before
+            # the failure stay where they are but return to the free pool, so
+            # their partial contents are never exposed.
+            for block_index in allocated:
+                heappush(self._free, block_index)
+            raise
+
+        # Commit the scheduling state only after every block write succeeded.
+        self._used_blocks += blocks_needed
+        self._messages[offset] = {
+            "key": work_key,
+            "length": len(payload),
+            "blocks": tuple(allocated),
+            "acks": 0,
+        }
+        for group in self._groups.values():
+            group["pending"].setdefault(work_key, deque()).append(offset)
+        self._next_offset = offset + 1
+        return offset
+
+    # ---- data plane: claim / ack / release ------------------------------
+
+    def claim(self, group_id):
+        """Claim this group's earliest available message, or ``None``."""
+        group = self._group(group_id)  # KeyError if unknown
+        pending = group["pending"]
+        chosen = None
+        for work_key, offsets in pending.items():
+            head = offsets[0]
+            if head not in group["claimed"]:
+                if chosen is None or head < chosen:
+                    chosen = head
+        if chosen is None:
+            return None
+
+        message = self._messages[chosen]
+        payload = self._read_payload(message)  # store failures propagate
+        revision = group["reader_revision"]
+        decoded = GuardedCodec(self._registry, revision).decode(payload)
+        logical_values = _live_required_values(
+            self._registry, revision, decoded, group["required"])
+
+        # Mark the claim only after the read succeeded.
+        group["claimed"].add(chosen)
+        ticket = _WorkTicket(self, group_id, chosen)
+        message.setdefault("tickets", {})[group_id] = ticket
+        return ticket, chosen, revision, logical_values
+
+    def _read_payload(self, message):
+        chunks = []
+        for block_index in message["blocks"]:
+            chunks.append(self._store.read(block_index))
+        return b"".join(chunks)[:message["length"]]
+
+    def ack(self, ticket):
+        """Mark one group's processing of one message complete."""
+        group_id, offset = self._validate_ticket(ticket)
+        group = self._groups[group_id]
+        message = self._messages[offset]
+
+        ticket.open = False
+        group["claimed"].discard(offset)
+        message["tickets"].pop(group_id, None)
+        work_key = message["key"]
+        deque_offsets = group["pending"][work_key]
+        deque_offsets.popleft()  # the acked message is always this key's head
+        if not deque_offsets:
+            del group["pending"][work_key]
+
+        # Blocks are freed only when the last group finishes.
+        message["acks"] += 1
+        if message["acks"] == len(self._groups):
+            for block_index in message["blocks"]:
+                heappush(self._free, block_index)
+            self._used_blocks -= len(message["blocks"])
+            del self._messages[offset]
+        return None
+
+    def release(self, ticket):
+        """Return one claimed message for this group to re-claim in place."""
+        group_id, offset = self._validate_ticket(ticket)
+        group = self._groups[group_id]
+        ticket.open = False
+        group["claimed"].discard(offset)
+        self._messages[offset]["tickets"].pop(group_id, None)
+        # The offset stays at the head of its key's deque, so a later claim
+        # picks the same message again rather than moving it to the tail.
+        return None
+
+    def _validate_ticket(self, ticket):
+        if not self._open_ticket(ticket):
+            raise ValueError("invalid, used, foreign, or superseded ticket")
+        group = self._groups[ticket.group]
+        message = self._messages.get(ticket.offset)
+        active = message is not None and message.get("tickets", {}).get(
+            ticket.group)
+        if (active is not ticket or ticket.offset not in group["claimed"]):
+            ticket.open = False
+            raise ValueError("invalid, used, foreign, or superseded ticket")
+        return ticket.group, ticket.offset

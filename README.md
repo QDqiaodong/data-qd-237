@@ -278,3 +278,78 @@ python3 compaction_memory_check.py --scenario scratch  # 单趟供给 + 160 MiB 
 sink 边收边核对 24,000 个检查点活键均来自覆盖记录、24,000 条后缀均为原字节且同分区
 位点连续。`--failure sink-tail` 与 `--failure read-last` 验证交付中途失败时批被
 discard、全程零交付、原日志不被改动。
+
+## 有限暂存空间下的按键工作队列：`WorkRelay`
+
+`WorkRelay(registry, store, groups, *, block_size, block_count)` 在调用方独占的
+固定块区上提供同进程工作队列。多个处理组从同一组任务里领取，但同一业务键
+（逻辑字段 `work_key`）的后续任务必须等本组前一条处理完；其他键照常可领。一条消息
+占用的块只计一次，直到最后一个组确认完成才归还。审计组和处理组可以各自落后。
+
+- `groups` 是 1–8 个非空组名到 `(reader_revision, required_keys)` 的映射，构造后
+  固定；每组所需逻辑字段非空、必须包含 `work_key`，且都由本组修订声明，参与修订
+  至多 24 个物理字段。
+- `block_size` 取 256/512/1024/2048/4096，`block_count` 取 1–32,768。调用方给的块区
+  共 `block_count + 4096 // block_size` 块；只有编号小于 `block_count` 的普通块计入
+  接单额度，额外块仅供搬动已入队数据。消息按线上字节向上折算成整块，单条至多 4096 字节。
+- `send(writer_revision, values)` 用写修订的 guarded Codec 编码（生产限制以提交时为
+  准）。`work_key` 必须是写端真实写出的非空字符串，UTF-8 至多 128 字节，不能由读默认
+  值补造。同一份字节必须能被每组的 guarded Codec 解码，并在每个所需逻辑字段上与写端
+  读值精确同类型、同值；否则抛 `DeliveryError`（`reason == "unfaithful"`）。所有消息
+  检查先于空间判断：空间不足抛 `DeliveryError`（`reason == "backlog_full"`）且不访问
+  储存。成功返回从 0 连续递增的位点，原始 JSON 字节原样落块，不重新编码。
+- `claim(group_id)` 返回 `(ticket, offset, reader_revision, logical_values)` 或
+  `None`，只看每个键在本组最早未确认的消息；`logical_values` 仅含本组所需字段，每次都
+  从块区原字节按本组读规则取得，不检查今天的生产限制。读失败原样传播且不记为已领。
+  `ack(ticket)` 确认完成，`release(ticket)` 放回原位点供重领（不移到队尾）；二者均不
+  访问块区。凭据不透明且一次性，用错中继、重复使用或重领后拿旧凭据确认都抛
+  `ValueError`，不改变任何组进度。
+- 写入失败原样传播：失败消息不可领、不占额度、不消耗位点；已成功写入的块不自动回滚，
+  但其部分内容不会暴露。储存中的消息内容不跨调用缓存。未知修订/组抛 `KeyError`，其余
+  无效输入抛 `ValueError`，写端原编码异常不改写。
+
+```python
+from contracts import DeliveryError, Field, Registry, WorkRelay
+
+registry = Registry()
+revision = registry.register(
+    {"wk": Field(str), "n": Field(int, 0)},
+    aliases={"wk": "work_key", "n": "sequence"})
+
+
+class BlockStore:  # 调用方拥有的固定块区：read(i)/write(i, block)
+    def __init__(self, count, block_size):
+        self._blocks = [b"\x00" * block_size for _ in range(count)]
+
+    def read(self, index):
+        return self._blocks[index]
+
+    def write(self, index, block):
+        self._blocks[index] = block
+
+
+block_size, block_count = 256, 8
+store = BlockStore(block_count + 4096 // block_size, block_size)
+relay = WorkRelay(
+    registry, store,
+    {"audit": (revision, ("work_key", "sequence")),
+     "processing": (revision, ("work_key", "sequence"))},
+    block_size=block_size, block_count=block_count)
+
+offset = relay.send(revision, {"wk": "order-1", "n": 7})
+ticket, offset, reader_revision, values = relay.claim("processing")
+# values == {"work_key": "order-1", "sequence": 7}
+relay.ack(ticket)                      # 处理组完成；块仍要等审计组确认才归还
+audit_ticket, _, _, _ = relay.claim("audit")
+relay.ack(audit_ticket)               # 最后一个组完成，块回到空闲池
+
+try:
+    relay.send(revision, {"wk": "order-2"})
+except DeliveryError as error:
+    error.reason                       # "backlog_full" 或 "unfaithful"
+```
+
+```sh
+python3 -m unittest -v test_work_relay
+```
+
