@@ -51,16 +51,19 @@ class SemanticIncompatible(Incompatible):
 
 
 class DeliveryError(ValueError):
-    """A valid publish request has no complete delivery plan.
+    """A valid publish or live-relay request has no complete delivery plan.
 
     ``reason`` is ``"uncovered"`` when some subscription has no enabled,
     readable version that can faithfully carry its required logical fields,
-    or ``"budget"`` when every subscription has candidates but no complete
-    assignment fits both the variant and the byte budget.
+    ``"budget"`` when every subscription has candidates but no complete
+    assignment fits both the variant and the byte budget, ``"unfaithful"``
+    when a live-relay subscriber cannot read the writer's exact bytes with
+    its bound read revision, or ``"backlog_full"`` when enqueueing would
+    leave more than 16,384 messages unread by some subscriber.
     """
 
     def __init__(self, reason, detail=""):
-        if reason not in ("uncovered", "budget"):
+        if reason not in ("uncovered", "budget", "unfaithful", "backlog_full"):
             raise ValueError("unknown delivery failure reason")
         self.reason = reason
         super().__init__(f"{reason}: {detail}" if detail else reason)
@@ -1616,3 +1619,320 @@ def compact_changelog(registry, count, read, restart_marks, replica_fence, sink,
         for key in range(scratch_count):
             scratch.drop(key)
     return cuts
+
+
+# ---------------------------------------------------------------------------
+# Live relay: enqueue under the current writer, drain per subscriber, and
+# switch one subscriber's read revision online after checking its backlog.
+#
+# The relay never keeps payload bytes: each message stays in the caller's log.
+# Cutover verdicts are cold-computed once during ``prepare_cutover`` and warm-
+# computed by ``send`` for messages enqueued while a ticket is open, so commit
+# needs no log access at all.  Resident state is a handful of counters plus a
+# set of blocking offsets, and it does not grow with already-consumed traffic.
+# ---------------------------------------------------------------------------
+LIVE_MAX_SUBSCRIPTIONS = 8
+LIVE_MAX_FIELDS = 24
+LIVE_MAX_PAYLOAD_BYTES = 4 * 1024
+LIVE_MAX_UNREAD = 16_384
+
+
+@dataclass
+class _LiveSubscriber:
+    reader_revision: int
+    required_keys: tuple  # logical names, deduplicated, insertion order
+
+
+class _LiveTicket:
+    """Opaque handle for one pending subscriber cutover."""
+
+    __slots__ = ("relay", "subscription_id", "target_revision", "open",
+                 "prepare_blockers", "post_blockers")
+
+    def __init__(self, relay, subscription_id, target_revision):
+        self.relay = relay
+        self.subscription_id = subscription_id
+        self.target_revision = target_revision
+        self.open = True
+        # Verdicts recorded by prepare for the then-unread range and by send
+        # for messages enqueued while this ticket stayed open.  Both hold only
+        # the blocking offsets, never payload bytes.
+        self.prepare_blockers = set()
+        self.post_blockers = set()
+
+
+def _live_reverse_aliases(registry, revision):
+    return {logical: physical
+            for physical, logical in registry._aliases[revision - 1].items()}
+
+
+def _live_required_values(registry, revision, decoded, required_keys):
+    """Project a physical decode onto a subscription's logical field set."""
+    reverse = _live_reverse_aliases(registry, revision)
+    return {key: decoded[reverse[key]] for key in required_keys}
+
+
+def _live_read_required(registry, payload, revision, required_keys):
+    """A revision's faithful view of the required logical fields, or ``None``.
+
+    Uses the guarded codec (original physical rules plus that revision's
+    receiving policy, never today's production limit) and the revision's own
+    defaults.  A reader that cannot interpret the bytes yields ``None``.
+    """
+    try:
+        decoded = GuardedCodec(registry, revision).decode(payload)
+        return _live_required_values(registry, revision, decoded, required_keys)
+    except Exception:
+        return None
+
+
+def _live_cutover_blocked(registry, payload, old_revision, target_revision,
+                          required_keys):
+    """Would ``target_revision`` change any required field's value or type?
+
+    Compares the value and exact type the current binding promises with what
+    the target revision actually reads from the same raw bytes.
+    """
+    old = _live_read_required(registry, payload, old_revision, required_keys)
+    new = _live_read_required(registry, payload, target_revision, required_keys)
+    if old is None or new is None:
+        return True
+    for key in required_keys:
+        old_value, new_value = old[key], new[key]
+        if type(old_value) is not type(new_value) or old_value != new_value:
+            return True
+    return False
+
+
+class LiveRelay:
+    """Single-process relay over a caller-managed append-only log.
+
+    ``subscriptions`` maps non-empty ids to ``(reader_revision,
+    required_keys)``.  Members and their required logical fields are fixed at
+    construction; only the read revision can move, and only through
+    ``prepare_cutover`` / ``commit_cutover``.  Every message is offered to
+    every subscriber, in write order, and each subscriber advances an
+    independent position and sees each message once.
+    """
+
+    def __init__(self, registry, store, subscriptions):
+        if not isinstance(registry, Registry):
+            raise ValueError("registry must be a Registry")
+        for method in ("put", "get"):
+            if not callable(getattr(store, method, None)):
+                raise ValueError("store must provide put/get")
+        self._registry = registry
+        self._store = store
+
+        if not isinstance(subscriptions, Mapping) or not subscriptions:
+            raise ValueError("subscriptions must be a non-empty mapping")
+        if len(subscriptions) > LIVE_MAX_SUBSCRIPTIONS:
+            raise ValueError("too many subscriptions")
+        self._subscribers = {}
+        self._positions = {}
+        for sid, spec in subscriptions.items():
+            if type(sid) is not str or not sid:
+                raise ValueError("subscription ids must be non-empty strings")
+            try:
+                reader_revision, required_keys = spec
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "subscription value must be (reader_revision, required_keys)") \
+                    from None
+            fields, _ = registry._version(reader_revision)  # KeyError if unknown
+            if len(fields) > LIVE_MAX_FIELDS:
+                raise ValueError(
+                    "relay revisions may declare at most 24 physical fields")
+            if isinstance(required_keys, (str, bytes, bytearray)) \
+                    or not hasattr(required_keys, "__iter__"):
+                raise ValueError(
+                    "required_keys must be a collection of logical names")
+            required = []
+            for key in required_keys:
+                if type(key) is not str or not key:
+                    raise ValueError("required keys must be non-empty strings")
+                if key not in required:
+                    required.append(key)
+            if not required:
+                raise ValueError("required keys must be non-empty")
+            self._require_declared(reader_revision, required)
+            self._subscribers[sid] = _LiveSubscriber(
+                reader_revision, tuple(required))
+            self._positions[sid] = 0
+
+        self._next_offset = 0
+        self._ticket = None
+
+    # ---- validation helpers ---------------------------------------------
+
+    def _require_declared(self, revision, required_keys):
+        reverse = _live_reverse_aliases(self._registry, revision)
+        for key in required_keys:
+            if key not in reverse:
+                raise ValueError(
+                    f"revision {revision} does not declare logical field {key!r}")
+
+    def _subscriber(self, subscription_id):
+        if type(subscription_id) is not str:
+            raise KeyError(subscription_id)
+        try:
+            return self._subscribers[subscription_id]
+        except KeyError:
+            raise KeyError(subscription_id) from None
+
+    def _writer_logical(self, writer_revision, payload):
+        fields = self._registry._versions[writer_revision - 1]
+        aliases = self._registry._aliases[writer_revision - 1]
+        decoded = Codec(fields).decode(payload)
+        return {aliases[name]: value for name, value in decoded.items()}
+
+    def _open_ticket(self, ticket):
+        return (isinstance(ticket, _LiveTicket) and ticket.open
+                and ticket.relay is self)
+
+    # ---- data plane -----------------------------------------------------
+
+    def send(self, writer_revision, values):
+        """Encode once, check every subscriber, then enqueue the raw bytes."""
+        fields, _ = self._registry._version(writer_revision)  # KeyError
+        if len(fields) > LIVE_MAX_FIELDS:
+            raise ValueError(
+                "relay revisions may declare at most 24 physical fields")
+        writer = self._registry.codec(writer_revision, guarded=True)
+        payload = writer.encode(values)  # writer encoding errors propagate
+        if len(payload) > LIVE_MAX_PAYLOAD_BYTES:
+            raise ValueError("relay payload exceeds the 4 KiB limit")
+
+        writer_logical = self._writer_logical(writer_revision, payload)
+        self._check_faithful(payload, writer_logical)
+
+        # Enqueueing may not exceed the unread cap for any subscriber.  A
+        # message that was never admitted must not be counted against it.
+        if any(self._next_offset - position >= LIVE_MAX_UNREAD
+               for position in self._positions.values()):
+            raise DeliveryError("backlog_full")
+
+        offset = self._next_offset
+        ticket = self._ticket
+        post_blocked = False
+        if ticket is not None:
+            # The target revision's required declarations were validated when
+            # the ticket was prepared; only its current verdict is recorded.
+            subscriber = self._subscribers[ticket.subscription_id]
+            post_blocked = _live_cutover_blocked(
+                self._registry, payload, subscriber.reader_revision,
+                ticket.target_revision, subscriber.required_keys)
+
+        # Write the log first; only a successful write lets the caller (and
+        # later polls) see the message.  A failed write consumes nothing.
+        self._store.put(offset, payload)
+        self._next_offset = offset + 1
+        if post_blocked:
+            ticket.post_blockers.add(offset)
+            if len(ticket.post_blockers) > LIVE_MAX_UNREAD:
+                # Keep only verdicts still inside the subscriber's unread
+                # range so a long-open ticket cannot accumulate consumed ones.
+                head = self._positions[ticket.subscription_id]
+                ticket.post_blockers = {
+                    item for item in ticket.post_blockers if item >= head}
+        return offset
+
+    def _check_faithful(self, payload, writer_logical):
+        for sid, subscriber in self._subscribers.items():
+            read = _live_read_required(
+                self._registry, payload, subscriber.reader_revision,
+                subscriber.required_keys)
+            if read is None:
+                raise DeliveryError(
+                    "unfaithful",
+                    f"subscription {sid!r} cannot read revision "
+                    f"{subscriber.reader_revision} bytes")
+            for key in subscriber.required_keys:
+                if key not in writer_logical:
+                    raise DeliveryError(
+                        "unfaithful",
+                        f"writer does not declare logical field {key!r}")
+                writer_value = writer_logical[key]
+                reader_value = read[key]
+                if (type(writer_value) is not type(reader_value)
+                        or writer_value != reader_value):
+                    raise DeliveryError(
+                        "unfaithful",
+                        f"subscription {sid!r} would change {key!r}")
+
+    def poll(self, subscription_id):
+        """Next unread message for one subscriber, or ``None``."""
+        subscriber = self._subscriber(subscription_id)  # KeyError if unknown
+        offset = self._positions[subscription_id]
+        if offset >= self._next_offset:
+            return None
+        payload = self._store.get(offset)  # store failures propagate
+        decoded = GuardedCodec(
+            self._registry, subscriber.reader_revision).decode(payload)
+        values = _live_required_values(
+            self._registry, subscriber.reader_revision, decoded,
+            subscriber.required_keys)
+        self._positions[subscription_id] = offset + 1
+        return offset, subscriber.reader_revision, values
+
+    # ---- control plane --------------------------------------------------
+
+    def prepare_cutover(self, subscription_id, reader_revision):
+        """Open one pending switch and cold-check the current backlog once."""
+        subscriber = self._subscriber(subscription_id)  # KeyError if unknown
+        fields, _ = self._registry._version(reader_revision)  # KeyError
+        if len(fields) > LIVE_MAX_FIELDS:
+            raise ValueError(
+                "relay revisions may declare at most 24 physical fields")
+        self._require_declared(reader_revision, subscriber.required_keys)
+        if self._ticket is not None:
+            raise ValueError("a cutover is already pending")
+
+        head = self._positions[subscription_id]
+        ticket = _LiveTicket(self, subscription_id, reader_revision)
+        self._ticket = ticket
+        try:
+            for offset in range(head, self._next_offset):
+                payload = self._store.get(offset)  # one read per offset
+                if _live_cutover_blocked(
+                        self._registry, payload, subscriber.reader_revision,
+                        reader_revision, subscriber.required_keys):
+                    ticket.prepare_blockers.add(offset)
+        except BaseException:
+            # A read failure makes this prepare ineffective and propagates
+            # unchanged; bindings and progress are untouched.
+            ticket.open = False
+            self._ticket = None
+            raise
+        return ticket
+
+    def commit_cutover(self, ticket):
+        """Apply the pending switch iff the current unread range is faithful.
+
+        Uses only facts already held in the process: prepare verdicts plus
+        verdicts recorded by ``send`` for messages enqueued while this ticket
+        stayed open.  Never calls ``store.get`` or ``store.put``.
+        """
+        if not self._open_ticket(ticket):
+            raise ValueError("invalid, used, or foreign cutover ticket")
+        subscriber = self._subscribers[ticket.subscription_id]
+        head = self._positions[ticket.subscription_id]
+
+        blockers = [offset for offset in ticket.prepare_blockers
+                    if offset >= head]
+        blockers.extend(offset for offset in ticket.post_blockers
+                        if offset >= head)
+        if blockers:
+            return min(blockers)  # ticket, binding and progress stay usable
+
+        subscriber.reader_revision = ticket.target_revision
+        ticket.open = False
+        self._ticket = None
+        return None
+
+    def cancel_cutover(self, ticket):
+        """Close a pending switch; bindings and progress stay as they were."""
+        if not self._open_ticket(ticket):
+            raise ValueError("invalid, used, or foreign cutover ticket")
+        ticket.open = False
+        self._ticket = None
