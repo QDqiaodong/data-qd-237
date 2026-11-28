@@ -210,3 +210,71 @@ python3 replay_memory_check.py --records 70000 --state-bytes 1200
 
 `demo.py` 演示同一消息、同一组订阅方在 1 份/61 字节（共享表示）、2 份/36 字节
 （两份窄表示）与 1 份/36 字节（`budget` 失败）三种预算下的不同交付结果。
+
+## 冷日志裁剪：`compact_changelog`
+
+`compact_changelog(registry, count, read, restart_marks, replica_fence, sink, *,
+max_checkpoint_bytes, max_tail_bytes, scratch=None)` 把一段从空状态开始的封存日志
+裁成"检查点 + 原字节后缀"：新副本从检查点加后缀恢复，落后副本从自己持久化的
+`replica_fence` 位点继续读原记录。一笔跨分区事务要么整体进入检查点、要么整体留在
+后缀，两个独立的字节预算可以正好用尽、不能互借。
+
+```python
+from contracts import CompactionError, Field, Registry, compact_changelog
+
+registry = Registry()
+rev_a = registry.register(
+    {"ak": Field(str, ""), "ad": Field(bool, False), "av": Field(str, "")},
+    aliases={"ak": "key", "ad": "deleted", "av": "value"})
+rev_b = registry.register(
+    {"bk": Field(str, ""), "bd": Field(bool, False), "bv": Field(str, "ready")},
+    aliases={"bk": "key", "bd": "deleted", "bv": "value"})
+registry.set_emit_policy(rev_b, [[("ne", "bv", "ready")]])  # 现在不得生产该值
+
+records = [...]  # 冷日志；read(i) 返回 (partition, offset, txn, revision, payload)
+read = records.__getitem__
+cuts = compact_changelog(
+    registry, len(records), read,
+    {"a": {0, 1, 2, 3}, "b": {0, 1, 2}},   # 每分区允许的 cut（含 0、至多 16 个）
+    {"a": 3, "b": 1},                      # 在线副本最小未读位点
+    sink,                                  # checkpoint/tail/seal/discard
+    max_checkpoint_bytes=len(b'["b","b","ready"]'),
+    max_tail_bytes=tail_payload_bytes)
+# cuts == {"a": 2, "b": 1}；检查点只有 b 的 "ready"（按读默认值，不受生产限制），
+# 后缀是事务 3、4 的原字节；恢复后只剩 a 的 y:""。
+```
+
+规则要点：
+
+- `read(i)` 逐条取记录（0 至 count-1，count ≤ 80,000），同一序号内容不变但可能
+  抛异常；完成判断前每条输入都会被检查，源异常原样传播、绝不读成"无解"。记录按
+  所带修订的物理读规则与接收约束解释（不是当前生产限制），经冻结别名得到逻辑
+  `key`/`deleted`/`value`；`key`、`deleted` 的物理键必须真实出现，key 的 UTF-8
+  长 1–128 字节，value 至多 3072 字节（删除记录不用 value 但仍须通过读规则）。
+- 每分区 offset 恰好覆盖 `[0, end)`，事务号按 offset 严格递增，同事务每分区至多
+  一条变更；`restart_marks`/`replica_fence` 覆盖同一组 1–12 个分区，cut 选自允许
+  集合且不超过 fence，空分区也出现在返回的 cuts 里。
+- 检查点按 `json.dumps([partition,key,value], ensure_ascii=True,
+  separators=(",",":"))` 的 ASCII 长度逐活键计费；后缀按保留记录的原 payload
+  长度计费。存在完整可行方案就交付一个（不要求最优），有效输入无解抛
+  `CompactionError`（`reason == "no_fit"`）；输入错误抛 `ValueError`，不存在的
+  合法修订号抛 `KeyError`。
+- 先完成整批校验与选点，再流式调用 `sink.checkpoint(partition,key,value)` 与
+  `sink.tail(record)`（同分区 offset 严格递增），完成后 `sink.seal(cuts)` 一次并
+  返回 cuts。交付途中出错：已暂交的批用 `sink.discard()` 丢弃、不 seal、原错误
+  传播。可选 `scratch`（`put/get/drop`）是调用方给的一次性字节暂存；没有它时
+  交付阶段按序号重读冷源，有它时单趟冷读即可。成功或失败暂存都被清空。
+
+```sh
+python3 compaction_example.py
+python3 -m unittest -v
+python3 compaction_memory_check.py --scenario reread   # 无暂存，冷读额度 120,000
+python3 compaction_memory_check.py --scenario scratch  # 单趟供给 + 160 MiB 磁盘暂存
+```
+
+内存验收在全新进程进行：两个分区各 36,000 条变更（12,000 写键、12,000 逐键覆盖、
+12,000 写新键），值是按运行私有种子生成的 2048 字节不可压缩内容，输入逆序供给。
+两种配额下都必须实际 seal `{"a": 24000, "b": 24000}`、峰值 RSS ≤ 64 MiB、暂存清零；
+sink 边收边核对 24,000 个检查点活键均来自覆盖记录、24,000 条后缀均为原字节且同分区
+位点连续。`--failure sink-tail` 与 `--failure read-last` 验证交付中途失败时批被
+discard、全程零交付、原日志不被改动。

@@ -1,10 +1,13 @@
 """A JSON record codec and a cumulative rollout compatibility registry."""
+from array import array
+from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 
 
@@ -1182,3 +1185,434 @@ def replay_window(registry, records, windows, deliver, *, scratch_dir):
             return next_offsets, blocked
         finally:
             conn.close()
+
+
+# Changelog-compaction admission limits.  These deliberately apply only to
+# compact_changelog; registration, Codec, Registry.publish and replay_window
+# keep their own rules.
+COMPACT_MAX_RECORDS = 80_000
+COMPACT_MAX_PARTITIONS = 12
+COMPACT_MAX_RESTART_MARKS = 16
+COMPACT_MAX_REVISIONS = 32
+COMPACT_MAX_SCHEMA_FIELDS = 24
+COMPACT_MAX_PAYLOAD_BYTES = 4 * 1024
+COMPACT_MAX_KEY_BYTES = 128
+COMPACT_MAX_VALUE_BYTES = 3072
+_COMPACT_OFFSET_MAX = 2**63 - 1
+_COMPACT_PARTITION_RE = re.compile(r"[0-9A-Za-z_-]{1,64}\Z")
+
+
+class CompactionError(ValueError):
+    """A valid compaction request has no complete feasible plan.
+
+    ``reason`` is ``"no_fit"``: every record checked out, but no choice of
+    per-partition cuts honours the replica fences, keeps every transaction
+    whole, and fits both the checkpoint and the tail byte budgets.
+    """
+
+    def __init__(self, reason, detail=""):
+        if reason != "no_fit":
+            raise ValueError("unknown compaction failure reason")
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+def _valid_compact_partition(name):
+    return type(name) is str and _COMPACT_PARTITION_RE.fullmatch(name) is not None
+
+
+def _changelog_logical_values(registry, revision, payload):
+    """Decode one changelog record into its logical (key, deleted, value).
+
+    Uses the record revision's own physical read rules and its receiving
+    constraints (never the current production limit), then maps the frozen
+    aliases onto the logical key/deleted/value fields.  The physical keys for
+    ``key`` and ``deleted`` must really be present; defaults or undeclared
+    same-named keys cannot stand in for them.
+    """
+    fields = registry._versions[revision - 1]
+    aliases = registry._aliases[revision - 1]
+    if len(fields) > COMPACT_MAX_SCHEMA_FIELDS:
+        raise ValueError("changelog schema has too many physical fields")
+    physical_for = {}
+    for physical, logical in aliases.items():
+        physical_for[logical] = physical
+    try:
+        key_physical = physical_for["key"]
+        deleted_physical = physical_for["deleted"]
+        value_physical = physical_for["value"]
+    except KeyError:
+        raise ValueError(
+            "revision does not alias the key/deleted/value logical fields") from None
+    for physical, kind in ((key_physical, str), (deleted_physical, bool),
+                           (value_physical, str)):
+        if fields[physical].kind is not kind:
+            raise ValueError("changelog logical field has the wrong physical type")
+
+    # The same parse/normalization path as a guarded decode: original physical
+    # rules plus the revision's receiving policy, with the raw object kept so
+    # presence checks see the real keys.
+    raw = json.loads(payload, object_pairs_hook=_duplicates)
+    decoded = Codec(fields)._normalize(raw, fill_defaults=True)
+    failing = _first_failing_clause(
+        registry._policies[revision - 1], raw, _read_view(fields, raw))
+    if failing is not None:
+        raise PolicyViolation("read", failing)
+
+    if key_physical not in raw:
+        raise ValueError("key must be present physically")
+    if deleted_physical not in raw:
+        raise ValueError("deleted must be present physically")
+    key = decoded[key_physical]
+    deleted = decoded[deleted_physical]
+    if not 1 <= len(key.encode("utf-8")) <= COMPACT_MAX_KEY_BYTES:
+        raise ValueError("key has invalid UTF-8 length")
+    if deleted:
+        # A delete never uses value, but the record still had to pass the
+        # revision's read rules above.
+        value = None
+    else:
+        value = decoded[value_physical]
+        if len(value.encode("utf-8")) > COMPACT_MAX_VALUE_BYTES:
+            raise ValueError("value has invalid UTF-8 length")
+    return key, deleted, value
+
+
+def compact_changelog(registry, count, read, restart_marks, replica_fence, sink,
+                      *, max_checkpoint_bytes, max_tail_bytes, scratch=None):
+    """Deliver a checkpoint plus an original-byte tail for a sealed changelog.
+
+    Reads ``count`` records through ``read(i)`` (each a ``(partition, offset,
+    transaction_id, revision, payload)`` tuple), checks every record, picks
+    one allowed cut per partition that stays at or below ``replica_fence``
+    and keeps every transaction whole, then streams the checkpoint (the live
+    keys obtained by applying the pre-cut transactions from empty) and the
+    retained tail records to ``sink`` and seals the batch.  Returns the cuts
+    (including empty partitions).
+
+    Checkpoint bytes are charged as
+    ``len(json.dumps([partition, key, value], ensure_ascii=True,
+    separators=(",", ":")).encode("ascii"))`` per live key; tail bytes are
+    charged as the retained records' original payload lengths.  The two
+    budgets are independent and may be exhausted exactly.
+
+    Raises ``ValueError`` for invalid input, ``KeyError`` for a positive but
+    unregistered revision, and ``CompactionError`` (``reason == "no_fit"``)
+    when a valid request has no feasible plan.  Source and scratch failures
+    propagate unchanged (they are never reported as ``no_fit``); once any
+    delivery call was made, a failure first drops the batch through
+    ``sink.discard()`` and then lets the original error propagate.  Supplied
+    scratch space is emptied again on every outcome.
+    """
+    # ---- argument validation (before any source read) ----
+    if type(count) is not int or not 0 <= count <= COMPACT_MAX_RECORDS:
+        raise ValueError("count must be an exact integer in [0, 80000]")
+    if not callable(read):
+        raise ValueError("read must be callable")
+    for budget in (max_checkpoint_bytes, max_tail_bytes):
+        if type(budget) is not int or budget < 0:
+            raise ValueError("budgets must be non-negative exact integers")
+    if not isinstance(restart_marks, Mapping) or not isinstance(
+            replica_fence, Mapping):
+        raise ValueError("restart_marks and replica_fence must be mappings")
+    if set(restart_marks) != set(replica_fence):
+        raise ValueError(
+            "restart_marks and replica_fence cover different partitions")
+    if not 1 <= len(restart_marks) <= COMPACT_MAX_PARTITIONS:
+        raise ValueError("expected 1 to 12 partitions")
+    partitions = sorted(restart_marks)
+    for name in partitions:
+        if not _valid_compact_partition(name):
+            raise ValueError("invalid partition name")
+    marks = {}
+    for name in partitions:
+        allowed = restart_marks[name]
+        if not isinstance(allowed, (set, frozenset)):
+            raise ValueError("restart marks must be sets or frozensets")
+        if len(allowed) > COMPACT_MAX_RESTART_MARKS or 0 not in allowed:
+            raise ValueError("restart marks need 0 and at most 16 entries")
+        for mark in allowed:
+            if type(mark) is not int or not 0 <= mark <= _COMPACT_OFFSET_MAX:
+                raise ValueError("restart marks must be exact offsets")
+        marks[name] = sorted(allowed)
+    fences = {}
+    for name in partitions:
+        fence = replica_fence[name]
+        if type(fence) is not int or not 0 <= fence <= _COMPACT_OFFSET_MAX:
+            raise ValueError("replica fences must be exact offsets")
+        fences[name] = fence
+    for method in ("checkpoint", "tail", "seal", "discard"):
+        if not callable(getattr(sink, method, None)):
+            raise ValueError("sink must provide checkpoint/tail/seal/discard")
+    if scratch is not None and any(
+            not callable(getattr(scratch, method, None))
+            for method in ("put", "get", "drop")):
+        raise ValueError("scratch must provide put/get/drop")
+
+    delivered = False
+    sealed = False
+    scratch_count = 0
+    try:
+        # ---- pass 1: read and check every record, keep only metadata ----
+        # recs[p] starts as (offset, txn, revision, payload_len, index, key,
+        # deleted, entry_size) per record and is repacked without the offset
+        # once coverage is validated; payloads themselves are either re-read
+        # later (no scratch) or staged through `scratch`.
+        index_of = {name: p for p, name in enumerate(partitions)}
+        recs = [[] for _ in partitions]
+        txn_parts = {}
+        referenced = set()
+        for i in range(count):
+            item = read(i)
+            if not isinstance(item, tuple) or len(item) != 5:
+                raise ValueError("changelog record must be a five-item tuple")
+            partition, offset, txn_id, revision, payload = item
+            if not _valid_compact_partition(partition):
+                raise ValueError("invalid partition name")
+            p = index_of.get(partition)
+            if p is None:
+                raise ValueError("record partition is not covered by the marks")
+            if type(offset) is not int or not 0 <= offset <= _COMPACT_OFFSET_MAX:
+                raise ValueError("offset must be an exact integer in [0, 2**63)")
+            if type(txn_id) is not int or not 1 <= txn_id <= _COMPACT_OFFSET_MAX:
+                raise ValueError(
+                    "transaction id must be an exact integer in [1, 2**63)")
+            if type(revision) is not int or revision < 1:
+                raise ValueError("revision must be a positive exact integer")
+            if revision > len(registry._versions):
+                raise KeyError(revision)
+            if revision not in referenced:
+                if len(referenced) >= COMPACT_MAX_REVISIONS:
+                    raise ValueError("too many referenced revisions")
+                referenced.add(revision)
+            if not isinstance(payload, bytes):
+                raise ValueError("payload must be bytes")
+            if len(payload) > COMPACT_MAX_PAYLOAD_BYTES:
+                raise ValueError("payload exceeds the 4 KiB limit")
+            key, deleted, value = _changelog_logical_values(
+                registry, revision, payload)
+            if deleted:
+                entry_size = 0
+            else:
+                entry_size = len(json.dumps(
+                    [partition, key, value], ensure_ascii=True,
+                    separators=(",", ":")).encode("ascii"))
+            recs[p].append((offset, txn_id, revision, len(payload), i,
+                            sys.intern(key), deleted, entry_size))
+            parts = txn_parts.setdefault(txn_id, {})
+            if p in parts:
+                raise ValueError("transaction has two changes in one partition")
+            parts[p] = offset
+            if scratch is not None:
+                scratch.put(i, payload)
+                scratch_count = i + 1
+
+        # ---- structural validation against the declared partition set ----
+        for p in range(len(partitions)):
+            entries = recs[p]
+            entries.sort()
+            for expected, entry in enumerate(entries):
+                if entry[0] != expected:
+                    raise ValueError(
+                        "partition offsets must cover [0, end) exactly")
+            previous_txn = 0
+            for entry in entries:
+                if entry[1] <= previous_txn:
+                    raise ValueError(
+                        "transaction ids must strictly increase with offset")
+                previous_txn = entry[1]
+            # Offsets now equal list positions; keep only the remaining
+            # fields: (txn, revision, payload_len, index, key, deleted,
+            # entry_size).  Replaced one at a time so the old and new rows
+            # never coexist in bulk.
+            for k, entry in enumerate(entries):
+                entries[k] = entry[1:]
+            recs[p] = entries
+        transactions = []
+        for parts in txn_parts.values():
+            if len(parts) > 1:
+                # Single-partition transactions can never be split by a cut.
+                transactions.append(tuple(sorted(parts.items())))
+        del txn_parts
+
+        # ---- cut search space ----
+        allowed = []
+        suffix_bytes = []
+        for p, name in enumerate(partitions):
+            end = len(recs[p])
+            if fences[name] > end:
+                raise ValueError("replica fence is outside [0, end]")
+            cuts_allowed = []
+            for mark in marks[name]:
+                if mark > end:
+                    raise ValueError("restart mark is outside [0, end]")
+                if mark <= fences[name]:
+                    cuts_allowed.append(mark)
+            allowed.append(cuts_allowed)
+            entries = recs[p]
+            suffix = array("q", bytes(8 * (end + 1)))
+            for k in range(end - 1, -1, -1):
+                suffix[k] = suffix[k + 1] + entries[k][2]
+            suffix_bytes.append(suffix)
+
+        # For transaction record (p, offset), the transaction is before the
+        # cut exactly when the partition's cut level reaches
+        # bisect_right(allowed[p], offset).  Atomicity: these predicates are
+        # equal for all records of one transaction.  Levels are stored as
+        # flat (p0, level0, p1, level1, ...) tuples to stay compact.
+        txn_levels = []
+        incidence = [[] for _ in partitions]
+        for parts in transactions:
+            levels = []
+            for p, offset in parts:
+                levels.append(p)
+                levels.append(bisect_right(allowed[p], offset))
+            txn_index = len(txn_levels)
+            txn_levels.append(tuple(levels))
+            for p, _offset in parts:
+                incidence[p].append(txn_index)
+        del transactions
+
+        partition_count = len(partitions)
+
+        def propagate(lo, hi, queue):
+            """Arc consistency on level ranges; False on contradiction."""
+            while queue:
+                levels = txn_levels[queue.pop()]
+                definite_after = False
+                definite_before = False
+                for k in range(0, len(levels), 2):
+                    p, level = levels[k], levels[k + 1]
+                    if hi[p] < level:
+                        definite_after = True
+                    if lo[p] >= level:
+                        definite_before = True
+                if definite_after and definite_before:
+                    return False
+                if definite_after:
+                    for k in range(0, len(levels), 2):
+                        p, level = levels[k], levels[k + 1]
+                        if hi[p] > level - 1:
+                            hi[p] = level - 1
+                            if hi[p] < lo[p]:
+                                return False
+                            queue.extend(incidence[p])
+                if definite_before:
+                    for k in range(0, len(levels), 2):
+                        p, level = levels[k], levels[k + 1]
+                        if lo[p] < level:
+                            lo[p] = level
+                            if lo[p] > hi[p]:
+                                return False
+                            queue.extend(incidence[p])
+            return True
+
+        def checkpoint_for(levels):
+            """Checkpoint bytes and live-key winners for one cut vector."""
+            live = [dict() for _ in partitions]
+            total = 0
+            for p in range(partition_count):
+                cut = allowed[p][levels[p]]
+                entries = recs[p]
+                live_p = live[p]
+                for offset in range(cut):
+                    entry = entries[offset]
+                    if entry[5]:
+                        live_p.pop(entry[4], None)
+                    else:
+                        live_p[entry[4]] = (entry[6], offset)
+                for entry_size, _offset in live_p.values():
+                    total += entry_size
+            return total, live
+
+        solution = None
+        solution_live = None
+        memo = set()
+
+        def search(lo, hi):
+            nonlocal solution, solution_live
+            if solution is not None:
+                return
+            state = (tuple(lo), tuple(hi))
+            if state in memo:
+                return
+            # Any vector inside this range keeps at least these tail bytes.
+            tail_lower = 0
+            for p in range(partition_count):
+                tail_lower += suffix_bytes[p][allowed[p][hi[p]]]
+            if tail_lower > max_tail_bytes:
+                memo.add(state)
+                return
+            if all(lo[p] == hi[p] for p in range(partition_count)):
+                total, live = checkpoint_for(lo)
+                if total <= max_checkpoint_bytes:
+                    solution = list(lo)
+                    solution_live = live
+                else:
+                    memo.add(state)
+                return
+            branch = min(
+                (p for p in range(partition_count) if lo[p] < hi[p]),
+                key=lambda p: hi[p] - lo[p])
+            for level in range(hi[branch], lo[branch] - 1, -1):
+                next_lo = list(lo)
+                next_hi = list(hi)
+                next_lo[branch] = next_hi[branch] = level
+                if propagate(next_lo, next_hi, list(incidence[branch])):
+                    search(next_lo, next_hi)
+                    if solution is not None:
+                        return
+            memo.add(state)
+
+        initial_lo = [0] * partition_count
+        initial_hi = [len(allowed[p]) - 1 for p in range(partition_count)]
+        if propagate(initial_lo, initial_hi, list(range(len(txn_levels)))):
+            search(initial_lo, initial_hi)
+        if solution is None:
+            raise CompactionError("no_fit")
+
+        # ---- streaming delivery of the planned batch ----
+        cuts = {name: allowed[p][solution[p]]
+                for p, name in enumerate(partitions)}
+
+        for p in range(partition_count):
+            name = partitions[p]
+            for key, (_size, offset) in solution_live[p].items():
+                entry = recs[p][offset]
+                if scratch is not None:
+                    payload = scratch.get(entry[3])
+                    revision = entry[1]
+                else:
+                    record = read(entry[3])
+                    revision = record[3]
+                    payload = record[4]
+                value = _changelog_logical_values(
+                    registry, revision, payload)[2]
+                delivered = True
+                sink.checkpoint(name, key, value)
+
+        for p in range(partition_count):
+            name = partitions[p]
+            entries = recs[p]
+            for offset in range(allowed[p][solution[p]], len(entries)):
+                entry = entries[offset]
+                delivered = True
+                if scratch is not None:
+                    sink.tail((name, offset, entry[0], entry[1],
+                               scratch.get(entry[3])))
+                else:
+                    sink.tail(read(entry[3]))
+
+        sink.seal(cuts)
+        sealed = True
+    except BaseException:
+        if delivered and not sealed:
+            sink.discard()
+        if scratch is not None:
+            for key in range(scratch_count):
+                scratch.drop(key)
+        raise
+    if scratch is not None:
+        for key in range(scratch_count):
+            scratch.drop(key)
+    return cuts
